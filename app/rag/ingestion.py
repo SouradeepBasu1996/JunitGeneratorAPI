@@ -10,105 +10,72 @@ import uuid
 import httpx
 import asyncio
 from typing import List, Dict, Any
+from app.config.settings import settings
 
 # === CONFIG ===
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MEDIA_ROOT = PROJECT_ROOT / "uploads"
-EXTRACT_FOLDER = PROJECT_ROOT / "temp_extracted"
-CHROMA_PATH = PROJECT_ROOT / "chroma_db"
-OLLAMA_URL = "http://localhost:11434"
-MODEL_NAME = "nomic-embed-text:latest"
-BATCH_SIZE = 8
+MODEL_NAME = settings.EMBEDDING_MODEL
+EMBED_DIM = settings.EMBEDDING_DIM
+BATCH_SIZE = settings.EMBED_BATCH_SIZE
+OLLAMA_URL = settings.LLM_URL.rstrip("/")  # just in case
+EMBED_TIMEOUT = settings.EMBED_TIMEOUT
 
-MEDIA_ROOT.mkdir(exist_ok=True)
-EXTRACT_FOLDER.mkdir(exist_ok=True)
-CHROMA_PATH.mkdir(exist_ok=True)
+MEDIA_ROOT = PROJECT_ROOT / settings.MEDIA_ROOT
+EXTRACT_FOLDER = PROJECT_ROOT / settings.EXTRACT_FOLDER
+CHROMA_PATH = PROJECT_ROOT / settings.CHROMA_PATH
+CHROMA_COLLECTION = settings.CHROMA_COLLECTION
+
+if getattr(settings, "AUTO_CREATE_DIRECTORIES", False):
+    MEDIA_ROOT.mkdir(exist_ok=True, parents=True)
+    EXTRACT_FOLDER.mkdir(exist_ok=True, parents=True)
+    CHROMA_PATH.mkdir(exist_ok=True, parents=True)
 
 # === ChromaDB ===
 client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-collection = client.get_or_create_collection(name="java_code")
+collection = client.get_or_create_collection(name=CHROMA_COLLECTION)
 
-# === Ollama Embedding Function ===
+
+# === Ollama Embedding Function (SYNC, run in thread from async) ===
 class OllamaEmbeddingFunction(embedding_functions.EmbeddingFunction):
     def __init__(self, model_name: str):
         self.model_name = model_name
 
-    async def _embed_single(self, text: str) -> List[float]:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            payload = {"model": self.model_name, "prompt": text}
-            try:
-                resp = await client.post(f"{OLLAMA_URL}/api/embeddings", json=payload)
-                resp.raise_for_status()
-                return resp.json()["embedding"]
-            except Exception as e:
-                print(f"[Embedding Error] {e}")
-                return [0.0] * 768
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        """
+        Synchronous, blocking HTTP calls to Ollama.
+        We'll call this from async code via asyncio.to_thread().
+        """
+        embeddings: List[List[float]] = []
+        with httpx.Client(timeout=EMBED_TIMEOUT) as client:
+            for text in texts:
+                payload = {"model": self.model_name, "prompt": text}
+                try:
+                    resp = client.post(f"{OLLAMA_URL}/api/embeddings", json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    emb = data.get("embedding")
+                    if not emb:
+                        raise ValueError("No 'embedding' field in embedding response")
+                except Exception as e:
+                    print(f"[Embedding Error] {e}")
+                    emb = [0.0] * EMBED_DIM
+                embeddings.append(emb)
+        return embeddings
 
-    async def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        results = await asyncio.gather(*[self._embed_single(t) for t in texts], return_exceptions=True)
-        return [[0.0] * 768 if isinstance(r, Exception) else r for r in results]
-
-    def __call__(self, input: List[str]) -> List[List[float]]:
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, self._embed_batch(input))
-            return future.result()
 
 ollama_ef = OllamaEmbeddingFunction(MODEL_NAME)
 
+
 # === Parse Java Code ===
 def parse_java_code(code: str, file_path: str, project_id: str) -> List[Dict[str, Any]]:
-    chunks = []
+    chunks: List[Dict[str, Any]] = []
+
+    # FULL CLASS FIRST
     try:
         tree = javalang.parse.parse(code)
-    except Exception as e:
-        print(f"[Parse Error] {file_path}: {e}")
-        return chunks
+        class_name = tree.types[0].name if tree.types else "Unknown"
 
-    lines = code.splitlines()
-
-    # Method chunks
-    for _, node in tree.filter(javalang.tree.MethodDeclaration):
-        start_line = node.position.line if node.position else 0
-        end_line = getattr(node, 'end_line', start_line + (len(node.body) if node.body else 0))
-        body = "\n".join(lines[start_line - 1:end_line]).strip()
-        if not body:
-            continue
-
-        chunk = {
-            "id": str(uuid.uuid4()),
-            "text": body,
-            "metadata": {
-                "project_id": project_id,
-                "file_path": file_path,
-                "type": "method",
-                "name": node.name,
-                "start_line": start_line,
-                "end_line": end_line,
-            }
-        }
-        chunks.append(chunk)
-
-    # Class chunks
-    for _, node in tree.filter(javalang.tree.ClassDeclaration):
-        start_line = node.position.line if node.position else 0
-        chunk = {
-            "id": str(uuid.uuid4()),
-            "text": f"class {node.name} {{ /* methods omitted */ }}",
-            "metadata": {
-                "project_id": project_id,
-                "file_path": file_path,
-                "type": "class",
-                "name": node.name,
-                "start_line": start_line,
-            }
-        }
-        chunks.append(chunk)
-
-    # Full class chunk
-    if tree.types:
-        class_name = tree.types[0].name if hasattr(tree.types[0], 'name') else "Unknown"
-        full_chunk = {
+        chunks.append({
             "id": str(uuid.uuid4()),
             "text": code.strip(),
             "metadata": {
@@ -117,10 +84,50 @@ def parse_java_code(code: str, file_path: str, project_id: str) -> List[Dict[str
                 "type": "full_class",
                 "name": class_name,
             }
-        }
-        chunks.append(full_chunk)
+        })
+
+    except Exception as e:
+        print(f"[Parse Error] {file_path}: {e}")
+        return chunks
+
+    lines = code.splitlines()
+
+    # === Better method end-line resolution ===
+    def find_method_end(start_idx: int) -> int:
+        depth = 0
+        for i in range(start_idx, len(lines)):
+            if "{" in lines[i]:
+                depth += lines[i].count("{")
+            if "}" in lines[i]:
+                depth -= lines[i].count("}")
+            if depth <= 0:
+                return i + 1
+        return start_idx + 1
+
+    # Method chunks
+    for _, node in tree.filter(javalang.tree.MethodDeclaration):
+        start_line = node.position.line - 1 if node.position else 0
+        end_line = find_method_end(start_line)
+
+        body = "\n".join(lines[start_line:end_line]).strip()
+        if not body:
+            continue
+
+        chunks.append({
+            "id": str(uuid.uuid4()),
+            "text": body,
+            "metadata": {
+                "project_id": project_id,
+                "file_path": file_path,
+                "type": "method",
+                "name": node.name,
+                "start_line": start_line + 1,
+                "end_line": end_line,
+            }
+        })
 
     return chunks
+
 
 # === Extract ZIP ===
 def extract_project_zip(project_id: str) -> Path:
@@ -139,77 +146,57 @@ def extract_project_zip(project_id: str) -> Path:
 
     return extract_path
 
+
 # === List Java Files ===
 def list_java_files(extract_path: Path) -> List[Dict[str, str]]:
-    files = []
+    files: List[Dict[str, str]] = []
     for f in extract_path.rglob("*.java"):
-        if f.is_file():
-            try:
-                content = f.read_text(encoding="utf-8")
-                rel_path = str(f.relative_to(extract_path.parent))
-                files.append({"path": rel_path, "content": content})
-            except Exception as e:
-                print(f"[File Read Error] {f}: {e}")
+        try:
+            files.append({
+                "path": str(f.relative_to(extract_path)),
+                "content": f.read_text(encoding="utf-8")
+            })
+        except Exception as e:
+            print(f"[File Read Error] {f}: {e}")
     return files
 
-# === BACKGROUND INGESTION FUNCTION ===
+
+# === INGESTION ===
 async def ingest_project(project_id: str):
     print(f"[INGEST] Starting for project: {project_id}")
-    try:
-        extract_path = extract_project_zip(project_id)
-        print(f"[INGEST] Extracted to: {extract_path}")
-    except Exception as e:
-        print(f"[INGEST] ZIP extraction failed: {e}")
-        raise
 
-    try:
-        java_files = list_java_files(extract_path)
-        print(f"[INGEST] Found {len(java_files)} Java files")
-    except Exception as e:
-        print(f"[INGEST] File listing failed: {e}")
-        raise
+    extract_path = extract_project_zip(project_id)
+    java_files = list_java_files(extract_path)
 
-    if not java_files:
-        print("[INGEST] No .java files found")
-        return
-
-    all_chunks = []
+    all_chunks: List[Dict[str, Any]] = []
     for jf in java_files:
-        print(f"[INGEST] Parsing: {jf['path']}")
-        try:
-            chunks = parse_java_code(jf["content"], jf["path"], project_id)
-            all_chunks.extend(chunks)
-            print(f"  → {len(chunks)} chunks")
-        except Exception as e:
-            print(f"[INGEST] Parse failed for {jf['path']}: {e}")
-
-    if not all_chunks:
-        print("[INGEST] No chunks parsed")
-        return
+        chunks = parse_java_code(jf["content"], jf["path"], project_id)
+        all_chunks.extend(chunks)
 
     print(f"[INGEST] Total chunks: {len(all_chunks)}")
+
+    if not all_chunks:
+        print("[INGEST] No chunks to embed")
+        return
 
     texts = [c["text"] for c in all_chunks]
     ids = [c["id"] for c in all_chunks]
     metadatas = [c["metadata"] for c in all_chunks]
 
-    print("Embedding chunks...")
+    print("[INGEST] Embedding...")
     for i in tqdm(range(0, len(texts), BATCH_SIZE), desc="Embedding"):
         batch_texts = texts[i:i + BATCH_SIZE]
         batch_ids = ids[i:i + BATCH_SIZE]
         batch_meta = metadatas[i:i + BATCH_SIZE]
 
-        try:
-            embeddings = ollama_ef(batch_texts)
-            print(f"  → Batch {i//BATCH_SIZE + 1}: {len(embeddings)} embeddings")
-            collection.upsert(
-                ids=batch_ids,
-                embeddings=embeddings,
-                documents=batch_texts,
-                metadatas=batch_meta
-            )
-        except Exception as e:
-            print(f"[INGEST] Embedding/Upsert failed for batch {i}: {e}")
-            raise
+        # run blocking embedding in a thread so FastAPI event loop is not blocked
+        embeddings = await asyncio.to_thread(ollama_ef, batch_texts)
 
-    print(f"[INGEST] Completed for {project_id}")
+        collection.upsert(
+            ids=batch_ids,
+            embeddings=embeddings,
+            documents=batch_texts,
+            metadatas=batch_meta
+        )
+
+    print(f"[INGEST] Completed for project {project_id}")
