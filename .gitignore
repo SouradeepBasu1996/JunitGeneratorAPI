@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Uploaded / generated files – runtime only
+uploads/
+
+# Java build outputs
+temp_extracted/**/target/
+*.class
+
+# Chroma runtime DB
+chroma_db/

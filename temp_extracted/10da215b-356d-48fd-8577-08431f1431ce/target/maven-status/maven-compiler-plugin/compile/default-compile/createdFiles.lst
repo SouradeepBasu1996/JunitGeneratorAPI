@@ -1,6 +1,0 @@
-com/online/shop/ShopOnline/entity/Order.class
-com/online/shop/ShopOnline/service/OrderService.class
-com/online/shop/ShopOnline/repository/OrderRepository.class
-com/online/shop/ShopOnline/entity/Order$OrderBuilder.class
-com/online/shop/ShopOnline/ShopOnlineApplication.class
-com/online/shop/ShopOnline/controller/OrderController.class

@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+psycopg2
+asyncpg
+python-multipart
+aiofiles
+dotenv
+ollama
+coverage
+pytest
+requests
+javalang>=0.13.0
+pydantic-settings
+chromadb

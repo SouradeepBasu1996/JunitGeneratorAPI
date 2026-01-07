@@ -1,6 +1,7 @@
 from fastapi import FastAPI # type: ignore
 from app.controller.upload_controller import router as upload_router
 from app.controller.generateTest_controller import router as generate_test_router
+from app.controller.download_controller import router as download_router
 
 from app.model.db import init_postgres, close_postgres
 #from app.middleware.cors_middleware import setup_cors
@@ -28,3 +29,5 @@ async def shutdown():
 app.include_router(upload_router)
 
 app.include_router(generate_test_router)
+
+app.include_router(download_router)
